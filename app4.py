@@ -9,8 +9,11 @@ from typing import List, Optional, Tuple
 import pandas as pd
 import requests
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 
 BASE_URL = "https://api.company-information.service.gov.uk"
+AUTO_REFRESH_MS = 3000
+AUTO_RUN_EVERY_SECONDS = 60
 
 TARGET_POSTCODE_PREFIXES = {
     "OX1", "OX2", "OX3", "OX4", "OX11", "OX14",
@@ -423,7 +426,7 @@ def run_pipeline(api_keys: List[str], date_from: str, date_to: str):
 
 st.set_page_config(page_title="Companies House Live Monitor", layout="wide")
 st.title("Companies House Live Monitor")
-st.caption("Manual refresh dashboard for filtered Companies House results.")
+st.caption("Auto-refreshing dashboard for filtered Companies House results.")
 
 if "last_run_time" not in st.session_state:
     st.session_state.last_run_time = None
@@ -431,13 +434,29 @@ if "last_run_time" not in st.session_state:
 if "last_new_rows" not in st.session_state:
     st.session_state.last_new_rows = []
 
+if "last_auto_run_ts" not in st.session_state:
+    st.session_state.last_auto_run_ts = 0.0
+
+if "last_status" not in st.session_state:
+    st.session_state.last_status = "Waiting to run."
+
 with st.sidebar:
     st.header("Search settings")
     default_date = datetime.today().strftime("%Y-%m-%d")
     date_from = st.text_input("Incorporation start date", value=default_date)
     date_to = st.text_input("Incorporation end date", value=default_date)
+    auto_refresh_enabled = st.toggle("Auto-refresh every 3 seconds", value=True)
     run_now = st.button("Refresh results now", type="primary")
     clear_data = st.button("Clear saved results")
+
+refresh_count = 0
+if auto_refresh_enabled:
+    refresh_count = st_autorefresh(
+        interval=AUTO_REFRESH_MS,
+        limit=None,
+        debounce=True,
+        key="companies_house_autorefresh",
+    )
 
 api_keys = get_api_keys_from_sources()
 
@@ -449,7 +468,10 @@ else:
         "or to a local .streamlit/secrets.toml file."
     )
 
-st.info("This version uses manual refresh only. Click 'Refresh results now' to run the search.")
+st.info(
+    f"Page refreshes every 3 seconds. Automatic data collection is throttled to once every "
+    f"{AUTO_RUN_EVERY_SECONDS} seconds unless you click 'Refresh results now'."
+)
 
 if clear_data:
     for path in [RESULTS_FILE, SEEN_FILE, OFFICER_CACHE_FILE]:
@@ -457,6 +479,8 @@ if clear_data:
             os.remove(path)
     st.session_state.last_run_time = None
     st.session_state.last_new_rows = []
+    st.session_state.last_auto_run_ts = 0.0
+    st.session_state.last_status = "Saved results and caches cleared."
     st.success("Saved results and caches cleared.")
     st.rerun()
 
@@ -467,8 +491,14 @@ except ValueError:
     st.error("Invalid date format. Please use YYYY-MM-DD.")
     st.stop()
 
-if run_now:
+now_ts = time.time()
+seconds_since_last_auto_run = now_ts - st.session_state.last_auto_run_ts
+auto_run_due = auto_refresh_enabled and seconds_since_last_auto_run >= AUTO_RUN_EVERY_SECONDS
+should_run_pipeline = run_now or auto_run_due
+
+if should_run_pipeline:
     if not api_keys:
+        st.session_state.last_status = "Cannot run: no API keys found."
         st.error("Please add at least one Companies House API key in Streamlit secrets before running the app.")
     else:
         try:
@@ -476,23 +506,31 @@ if run_now:
                 new_rows = run_pipeline(api_keys, date_from, date_to)
             st.session_state.last_new_rows = new_rows
             st.session_state.last_run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            st.success(f"Run completed at {st.session_state.last_run_time}")
+            st.session_state.last_auto_run_ts = time.time()
+            st.session_state.last_status = f"Run completed at {st.session_state.last_run_time}"
+            st.success(st.session_state.last_status)
         except Exception as e:
-            st.error(f"Error during run: {e}")
+            st.session_state.last_status = f"Error during run: {e}"
+            st.error(st.session_state.last_status)
 
 results_df = load_results_df()
 display_results_df = prepare_display_df(results_df)
 new_results_df = prepare_display_df(pd.DataFrame(st.session_state.last_new_rows)) if st.session_state.last_new_rows else pd.DataFrame()
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 col1.metric("Total results", len(results_df))
 col2.metric("New in last run", len(st.session_state.last_new_rows))
 col3.metric("Seen companies", len(load_json_file(SEEN_FILE, [])))
+col4.metric("Refresh count", refresh_count)
 
 if st.session_state.last_run_time:
     st.caption(f"Last successful refresh: {st.session_state.last_run_time}")
 else:
-    st.caption("No refresh run yet in this session.")
+    st.caption("No successful run yet in this session.")
+
+remaining = max(0, int(AUTO_RUN_EVERY_SECONDS - (time.time() - st.session_state.last_auto_run_ts)))
+st.caption(f"Next automatic pipeline run in approximately {remaining} seconds.")
+st.caption(st.session_state.last_status)
 
 st.subheader("New results from last run")
 if not new_results_df.empty:
